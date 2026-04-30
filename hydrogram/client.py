@@ -594,25 +594,44 @@ class Client(Methods):
             users = {u.id: u for u in updates.users}
             chats = {c.id: c for c in updates.chats}
 
-            for update in updates.updates:
-                channel_id = getattr(
-                    getattr(getattr(update, "message", None), "peer_id", None),
-                    "channel_id",
-                    None,
-                ) or getattr(update, "channel_id", None)
-
-                pts = getattr(update, "pts", None)
-                pts_count = getattr(update, "pts_count", None)
-
-                if isinstance(update, raw.types.UpdateChannelTooLong):
-                    log.info(update)
-
-                if isinstance(update, raw.types.UpdateNewChannelMessage) and is_min:
+            # ── ljlhubuserbot fork performance fix (humiuke-main) ──
+            # 上游这里在主 for 循环里**串行 await** ``GetChannelDifference``,
+            # 一批 N 个 ``UpdateNewChannelMessage`` 等 N 次 RPC,事件循环阻塞
+            # 严重(实测 P99 update 处理延迟雪崩)。而且同 channel 多个 update
+            # 各拉一次完全是浪费(diff 已经覆盖)。
+            #
+            # 修复:先扫描去重(同 channel_id 只保留 message_id 最大一项),
+            # 然后 ``asyncio.gather`` 并行 invoke,最后再走原本的 dispatcher 入队。
+            if is_min:
+                # channel_id -> (pts, pts_count, max_message_id)
+                channel_fetch_targets: dict[int, tuple[int, int, int]] = {}
+                for update in updates.updates:
+                    if not isinstance(update, raw.types.UpdateNewChannelMessage):
+                        continue
                     message = update.message
+                    if isinstance(message, raw.types.MessageEmpty):
+                        continue
+                    channel_id = getattr(
+                        getattr(getattr(update, "message", None), "peer_id", None),
+                        "channel_id",
+                        None,
+                    )
+                    if channel_id is None:
+                        continue
+                    pts = getattr(update, "pts", None)
+                    pts_count = getattr(update, "pts_count", None)
+                    if pts is None or pts_count is None:
+                        continue
+                    existing = channel_fetch_targets.get(channel_id)
+                    if existing is None or message.id > existing[2]:
+                        channel_fetch_targets[channel_id] = (pts, pts_count, message.id)
 
-                    if not isinstance(message, raw.types.MessageEmpty):
+                if channel_fetch_targets:
+                    async def _fetch_channel_diff(
+                        channel_id: int, pts: int, pts_count: int, message_id: int
+                    ):
                         try:
-                            diff = await self.invoke(
+                            return await self.invoke(
                                 raw.functions.updates.GetChannelDifference(
                                     channel=await self.resolve_peer(
                                         utils.get_channel_id(channel_id)
@@ -620,8 +639,8 @@ class Client(Methods):
                                     filter=raw.types.ChannelMessagesFilter(
                                         ranges=[
                                             raw.types.MessageRange(
-                                                min_id=update.message.id,
-                                                max_id=update.message.id,
+                                                min_id=message_id,
+                                                max_id=message_id,
                                             )
                                         ]
                                     ),
@@ -630,11 +649,34 @@ class Client(Methods):
                                 )
                             )
                         except ChannelPrivate:
-                            pass
-                        else:
-                            if not isinstance(diff, raw.types.updates.ChannelDifferenceEmpty):
-                                users.update({u.id: u for u in diff.users})
-                                chats.update({c.id: c for c in diff.chats})
+                            return None
+
+                    diffs = await asyncio.gather(
+                        *(
+                            _fetch_channel_diff(cid, pts, pts_count, mid)
+                            for cid, (pts, pts_count, mid) in channel_fetch_targets.items()
+                        ),
+                        return_exceptions=True,
+                    )
+                    for diff in diffs:
+                        # ChannelPrivate 已转 None;其他异常保留 raise 可见以利排障,
+                        # 但批量 fetch 不应让单失败拖垮整批 update,这里仅 log 跳过
+                        if diff is None:
+                            continue
+                        if isinstance(diff, BaseException):
+                            log.warning(
+                                "[%s] GetChannelDifference batch member failed: %s",
+                                self.name,
+                                diff,
+                            )
+                            continue
+                        if not isinstance(diff, raw.types.updates.ChannelDifferenceEmpty):
+                            users.update({u.id: u for u in diff.users})
+                            chats.update({c.id: c for c in diff.chats})
+
+            for update in updates.updates:
+                if isinstance(update, raw.types.UpdateChannelTooLong):
+                    log.info(update)
 
                 self.dispatcher.updates_queue.put_nowait((update, users, chats))
         elif isinstance(updates, (raw.types.UpdateShortMessage, raw.types.UpdateShortChatMessage)):
