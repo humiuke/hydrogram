@@ -115,8 +115,19 @@ class Session:
 
         self.last_reconnect_attempt = None
 
+    # ── ljlhubuserbot fork constant (humiuke-main) ──
+    # ``Session.start`` 网络持续故障时的重试上限。
+    # 上游 hydrogram ``while True:`` 无限重试,如果调用方期望 ``client.start()`` 在
+    # 合理时间返回(例如 watchdog 触发的 ``_restart_account``),网络持续不通会让
+    # 调用方永久卡住、僵尸 client 永不死亡。
+    # 30 次 + 指数退避(2~30s) ≈ 最多 ~10 分钟尝试,放弃后 raise ConnectionError
+    # 给上层(Account._restart_account 接住后丢弃 client,等 watchdog 下轮再触发)。
+    MAX_START_ATTEMPTS = 30
+
     async def start(self):
+        attempts = 0
         while True:
+            attempts += 1
             self.connection = self.client.connection_factory(
                 dc_id=self.dc_id,
                 test_mode=self.test_mode,
@@ -159,8 +170,34 @@ class Session:
             except AuthKeyDuplicated as e:
                 await self.stop()
                 raise e
-            except (OSError, RPCError):
+            except (OSError, RPCError) as e:
                 await self.stop()
+                # ── ljlhubuserbot fork fix (humiuke-main) ──
+                # 上游这里 ``await self.stop()`` 后什么都不做继续 while,网络持续
+                # 故障时会无限循环。加重试上限 + 指数退避 + 显式 raise,让上层
+                # 能区分"暂时性失败"(继续 retry)和"持久性失败"(放弃)。
+                if attempts >= Session.MAX_START_ATTEMPTS:
+                    log.error(
+                        "[%s] Session.start failed after %d attempts, giving up: %s",
+                        self.client.name,
+                        attempts,
+                        e,
+                    )
+                    raise ConnectionError(
+                        f"[{self.client.name}] Session start failed after "
+                        f"{Session.MAX_START_ATTEMPTS} attempts"
+                    ) from e
+                # 指数退避封顶 30s,前几次快速重试,长期故障时放慢
+                backoff = min(2 ** min(attempts, 6), 30)
+                log.warning(
+                    "[%s] Session.start attempt %d/%d failed (%s), retry in %ds",
+                    self.client.name,
+                    attempts,
+                    Session.MAX_START_ATTEMPTS,
+                    type(e).__name__,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
             except Exception as e:
                 await self.stop()
                 raise e
@@ -444,6 +481,19 @@ class Session:
                     or self.connection.protocol is None
                     or getattr(self.connection.protocol, "closed", True)
                 ):
+                    # ── ljlhubuserbot fork fix (humiuke-main) ──
+                    # 上游 hydrogram 此分支只 ``restart() + sleep(1) + continue``,**不减
+                    # retries 也不抛异常**。如果 ``restart()`` 起不来(账号被 LogOut /
+                    # DC 拒绝 / 网络持续丢包),整个 invoke 会陷入无限重试不抛异常
+                    # 死循环,业务层永远收不到 OSError 触发不了 _restart_account / 重连。
+                    # 修复:closed 分支也消耗 retries,N 次后 raise ConnectionError
+                    # (OSError 子类),让上层接住异常做处置。
+                    retries -= 1
+                    if retries == 0:
+                        raise ConnectionError(
+                            f"[{self.client.name}] Session connection closed "
+                            f"and reconnect failed after {Session.MAX_RETRIES} attempts"
+                        )
                     log.warning(
                         "[%s] Connection is closed or not established. Attempting to reconnect...",
                         self.client.name,
@@ -472,9 +522,15 @@ class Session:
                 if retries == 0:
                     raise e
 
+                # ── ljlhubuserbot fork fix (humiuke-main) ──
+                # 上游用 ``[%s]`` 打的是 retry 计数(1~9),跟 closed 分支的
+                # ``[client.name]`` 风格不一致,排障时定位不到是哪个 bot。
+                # 改成 ``[uid attempt=N/MAX]`` 同时保留两个信息。
                 (log.warning if retries < 2 else log.info)(
-                    '[%s] Retrying "%s" due to: %s',
+                    '[%s attempt=%d/%d] Retrying "%s" due to: %s',
+                    self.client.name,
                     Session.MAX_RETRIES - retries,
+                    Session.MAX_RETRIES,
                     query_name,
                     str(e) or repr(e),
                 )
