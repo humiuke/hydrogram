@@ -25,6 +25,18 @@ from .auto_name import AutoName
 class MessageEntityType(AutoName):
     """Message entity type enumeration used in :obj:`~hydrogram.types.MessageEntity`."""
 
+    @classmethod
+    def _missing_(cls, value):
+        # ── ljlhubuserbot fork fix (humiuke-main) ──
+        # Telegram MTProto schema 还在演进(例如 Layer 224 新增的 MessageEntityFormattedDate
+        # 在我们 raw schema 已有的版本里仍可能缺失 enum 映射),如果 raw entity class
+        # 不在 enum 值表里,``MessageEntityType(unknown_class)`` 会抛 ``ValueError``,
+        # 上层 ``MessageEntity._parse`` 直接崩溃,整批 message 解析中断。
+        # 这里通过 ``_missing_`` 钩子把未知 entity class 兜底到 UNKNOWN,
+        # 配合 ``MessageEntity._parse`` 把原始 raw 对象挂到 ``_raw_entity`` 属性,
+        # 下游想拿具体字段(FORMATTED_DATE 的 ``date`` 等)自行读取。
+        return cls.UNKNOWN
+
     MENTION = raw.types.MessageEntityMention
     "``@username``"
 

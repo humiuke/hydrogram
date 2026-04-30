@@ -83,10 +83,11 @@ class MessageEntity(Object):
             entity_type = enums.MessageEntityType.TEXT_MENTION
             user_id = entity.user_id.user_id
         else:
+            # 配合 ``MessageEntityType._missing_``,未知类型走 UNKNOWN 不再 raise
             entity_type = enums.MessageEntityType(entity.__class__)
             user_id = getattr(entity, "user_id", None)
 
-        return MessageEntity(
+        result = MessageEntity(
             type=entity_type,
             offset=entity.offset,
             length=entity.length,
@@ -96,6 +97,19 @@ class MessageEntity(Object):
             custom_emoji_id=getattr(entity, "document_id", None),
             client=client,
         )
+
+        # ── ljlhubuserbot fork extension (humiuke-main) ──
+        # 未知 entity class fallback 到 UNKNOWN 后,丢失了原始 raw 对象的所有字段
+        # (例如 FORMATTED_DATE 的 ``date`` 时间戳)。把原 entity 挂到 ``_raw_entity``,
+        # 下游业务需要的话可以 ``ent._raw_entity.date`` 之类直接读取。
+        # 不影响标准字段(offset/length/type)的正常解析。
+        if result is not None and result.type is enums.MessageEntityType.UNKNOWN:
+            try:
+                result._raw_entity = entity
+            except Exception:
+                pass
+
+        return result
 
     async def write(self):
         args = self.__dict__.copy()
