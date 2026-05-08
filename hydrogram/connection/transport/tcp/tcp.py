@@ -128,17 +128,50 @@ class TCP:
             self._closed = True
             raise TimeoutError("Connection timed out")
 
+    # Cap how long we'll wait for graceful FIN-ACK before forcing the socket
+    # closed via ``transport.abort()``. Must stay strictly below
+    # ``TCP.TIMEOUT`` and below any wrapper timeout in business code so the
+    # abort fallback path actually runs instead of being cancelled from
+    # outside (which would leave the fd in CLOSE-WAIT).
+    CLOSE_WAIT_TIMEOUT = 3
+
     async def close(self) -> None:
         if self.writer is None:
             self._closed = True
             return
 
+        writer = self.writer
         try:
-            self.writer.close()
-            await asyncio.wait_for(self.writer.wait_closed(), TCP.TIMEOUT)
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), TCP.CLOSE_WAIT_TIMEOUT)
         except Exception as e:
+            # ``writer.close()`` is fire-and-forget; ``wait_closed()`` only
+            # returns once the peer ACKs our FIN. If the peer dropped the
+            # connection ungracefully (TCP RST, NAT timeout, network blip)
+            # ``wait_closed()`` hangs and we end up with a CLOSE_WAIT fd
+            # leak — until the kernel TCP keepalive eventually reaps it
+            # (default ~2h on Linux), each leak occupies one fd and one
+            # peer-IP slot in the upstream rate limiter (Telegram DCs are
+            # particularly aggressive about this).
+            #
+            # ``transport.abort()`` is the only asyncio-level escape hatch:
+            # it forces a TCP RST and immediately releases the fd without
+            # waiting for any handshake. Skipping it is what historically
+            # produced the "Session.start attempt N/30 failed (TimeoutError)"
+            # avalanche that requires a process restart to recover from.
             log.info("Close exception: %s %s", type(e).__name__, e)
+            try:
+                transport = writer.transport
+                if transport is not None and not transport.is_closing():
+                    transport.abort()
+            except Exception as abort_err:
+                log.info(
+                    "Close abort fallback failed: %s %s",
+                    type(abort_err).__name__, abort_err,
+                )
         finally:
+            self.writer = None
+            self.reader = None
             self._closed = True
 
     async def send(self, data: bytes) -> None:
