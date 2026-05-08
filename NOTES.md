@@ -24,10 +24,12 @@ noreply 别名)。所有 commit 用这个邮箱,真实邮箱 `kleen@qq.com` 不�
 | `18558d8f` | 自家修复 | `fix(session): bound retries for connection-closed and Session.start` —— 修两个无限重试 bug:1) `Session.invoke` 的 `protocol.closed` 分支不消耗 retries;2) `Session.start` 里 `while True: connection.connect()` 不限次数。改完两者都会在 N 次失败后 raise `ConnectionError`,业务侧能接住 |
 | `e5176179` | 自家修复 | `feat(types): gracefully handle unknown MessageEntity types` —— `MessageEntityType._missing_` classmethod 让未知 entity class fallback 到 `UNKNOWN`,`MessageEntity._parse` 把原 raw 对象挂到 `_raw_entity`。Telegram schema 升级 lag(例如 `MessageEntityFormattedDate`)不再炸整批消息 |
 | `7155a327` | 自家修复 | `perf(client): parallelize per-channel GetChannelDifference` —— `Client.handle_updates` 的串行 `await GetChannelDifference` 改成"按 channel 去重 + `asyncio.gather` 并行",N 次串行 RPC 压到 O(1) 墙上时间 |
+| `ac3af3f4` | 自家修复 | `fix(connection): abort TCP transport when graceful close hangs` —— `TCP.close` 在 `wait_closed()` 失败/超时分支补 `transport.abort()`,同时缩 wait_closed 上限到 3s(新常量 `CLOSE_WAIT_TIMEOUT`,跟连接 / 读写用的 10s `TIMEOUT` 拆开)。线上观察到 sneaky-auto-invite 持续运行 22h 后,DC4(`149.154.175.53:443`)累积 54 个 CLOSE_WAIT fd(`Recv-Q` 还有 90KB 未读数据),触发 Telegram 对该 IP 拒新 Session.start 雪崩。`transport.abort()` 是 asyncio 唯一能"绕过 graceful FIN、强制 RST"的接口。同时 finally 把 `self.writer / self.reader` 置 None 让 GC 早点收掉残留 transport。 |
 
 Tag:
 - `v0.2.1.dev0+ljl.1` = HEAD at `2ee6b91d`(cherry-pick 完成时)
 - `v0.2.1.dev0+ljl.2` = HEAD at `7155a327`(B1-B5 全部合完)
+- `v0.2.1.dev0+ljl.3` = HEAD at `ac3af3f4`(TCP.close abort 兜底)
 
 ## 常见运维操作
 
@@ -95,3 +97,8 @@ pytest tests/  # 必跑
   如果它自己也加了 `_missing_` 就要 merge。
 - **`hydrogram/types/messages_and_media/message_entity.py` `_parse`**:在
   原 return 之上挂了 `_raw_entity`,upstream 改 `_parse` 实现时容易冲突。
+- **`hydrogram/connection/transport/tcp/tcp.py` `TCP.close`**:加了
+  `CLOSE_WAIT_TIMEOUT=3` 常量,失败分支补 `transport.abort()`,finally 清
+  `self.writer/reader`。upstream 若同函数有改动(尤其引入新的关闭路径)
+  rebase 时要 careful merge,务必保留 abort 兜底,否则线上会重新爆 CLOSE_WAIT
+  泄漏雪崩。
