@@ -24,6 +24,7 @@ import bisect
 import logging
 import os
 import random
+import sys
 from datetime import datetime
 from hashlib import sha1
 from io import BytesIO
@@ -54,6 +55,16 @@ from hydrogram.raw.all import layer
 from hydrogram.raw.core import FutureSalts, Int, MsgContainer, TLObject
 
 from .internals import MsgFactory, MsgId
+
+# ── ljlhubuserbot fork (humiuke-main) ──
+# 上游 1f290021 用 ``asyncio.timeout`` 取代 ``asyncio.wait_for``:3.8~3.11 的 ``wait_for`` 在
+# "内层刚好完成"的瞬间被取消时会吞掉 CancelledError,RPC 取消不掉、还留下待应答记录。
+# ``asyncio.timeout`` 是 3.11 才有的;线上是 3.10,用语义相同的 ``async_timeout`` 兜住
+# (超时同样抛 ``asyncio.TimeoutError``)。
+if sys.version_info >= (3, 11):
+    _timeout = asyncio.timeout
+else:
+    from async_timeout import timeout as _timeout
 
 if TYPE_CHECKING:
     from hydrogram.connection import Connection
@@ -630,7 +641,8 @@ class Session:
             if wait_response:
                 self.results[msg_id] = result
             try:
-                await asyncio.wait_for(connection.send(payload), timeout)
+                async with _timeout(timeout):
+                    await connection.send(payload)
             except (OSError, asyncio.TimeoutError) as e:
                 self.results.pop(msg_id, None)
                 self._request_recovery(e, connection=connection)
@@ -646,7 +658,8 @@ class Session:
             if not wait_response:
                 return None
             try:
-                await asyncio.wait_for(result.event.wait(), timeout)
+                async with _timeout(timeout):
+                    await result.event.wait()
             except asyncio.TimeoutError as e:
                 error = RequestTimeoutError(
                     "Request timed out; Telegram may have processed it. "
