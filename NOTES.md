@@ -35,6 +35,7 @@ mainline  https://github.com/hydrogram/hydrogram        ← 偶尔 cherry-pick �
 | `73492e30` | 自家修复 | `fix(connection): abort TCP transport when graceful close hangs` —— `TCP.close` 在 `wait_closed()` 失败/超时时 `transport.abort()`,上限 3s |
 | `cf67f38e` | 自家测试 | `test: regression tests for the 2026-11-24 zombie session incident` —— `tests/test_fork_incident_20261124.py`:已停止的会话网络恢复后不许再建连接;握手途中被关不算启动成功 |
 | `335c0894` | backport mainline `1f290021` | `fix(session): preserve RPC cancellation on Python 3.10` —— 上游用 `asyncio.timeout`(3.11+)取代 `wait_for`,修「取消被吞、留下待应答记录」;我们线上是 3.10,用 `async_timeout` 兜住(新增依赖 `async-timeout; python_version < '3.11'`) |
+| `1d3e59b7` | 自家修复 | `fix(client): clean up the session when start() is cancelled or fails after connect` —— `Client.start()` 连接成功后的步骤(GetState / get_me / initialize)被取消或失败时也断开。上游只接 `(Exception, KeyboardInterrupt)`,调用方用 `wait_for` 限时就会留下没人管的活会话 |
 
 mainline(`hydrogram/hydrogram`)2026-10-28 之后的其余提交(要求 Python ≥3.11、Layer 232 + 高层适配、MTProxy、
 媒体并发上限、随机 ID 等)**没有带**:线上是 Python 3.10;以后升级 Python 再评估整体换到 mainline。
