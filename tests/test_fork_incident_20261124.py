@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
+from hydrogram import Client
 from tests.test_connection_resilience import Harness
 
 
@@ -74,3 +76,57 @@ async def test_peer_close_during_handshake_is_not_a_started_session(monkeypatch)
         assert harness.session.ping_task is None
     finally:
         await harness.session.stop()
+
+
+def _connected_client(name: str) -> Client:
+    """connect() 已成功的 Client:会话是假的,只看 start() 失败时有没有把它停掉。"""
+    client = Client(name, in_memory=True)
+    session = AsyncMock()
+
+    async def connect():
+        client.session = session
+        client.is_connected = True
+        return True  # 已授权
+
+    client.connect = connect
+    client.storage.close = AsyncMock()
+    client.storage.is_bot = AsyncMock(return_value=False)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_start_cancelled_after_connect_stops_the_session():
+    """hub 用 wait_for 给 client.start() 限时;超时(取消)时已连上的会话必须被停掉。"""
+    client = _connected_client("start-cancelled")
+    entered = asyncio.Event()
+
+    async def hang(*_args, **_kwargs):
+        entered.set()
+        await asyncio.sleep(3600)
+
+    client.invoke = hang  # start() 里的 GetState 卡住
+    try:
+        task = asyncio.create_task(client.start())
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        client.session.stop.assert_awaited_once()
+        assert not client.is_connected
+    finally:
+        client.executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_failing_in_get_me_stops_the_session():
+    """连接和 GetState 都成功、get_me 失败:同样不能留下活会话。"""
+    client = _connected_client("start-get-me-fails")
+    client.invoke = AsyncMock(return_value=None)
+    client.get_me = AsyncMock(side_effect=RuntimeError("boom"))
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            await client.start()
+        client.session.stop.assert_awaited_once()
+        assert not client.is_connected
+    finally:
+        client.executor.shutdown()

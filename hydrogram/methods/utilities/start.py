@@ -17,6 +17,7 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Hydrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+import contextlib
 import logging
 
 import hydrogram
@@ -68,17 +69,27 @@ class Start:
 
             if self.update_manager is None:
                 await self.invoke(raw.functions.updates.GetState())
-        except (Exception, KeyboardInterrupt):
+        except BaseException:
+            # ── ljlhubuserbot fork fix (humiuke-main) ──
+            # 上游只接 ``(Exception, KeyboardInterrupt)``。调用方用 ``wait_for`` 给 start() 限时的话,
+            # 超时是 CancelledError:会话已经连上、带着心跳,client 却被调用方丢掉,
+            # 成了没人管的活会话(2026-11-24 事故同一类泄漏)。
             await self.disconnect()
             raise
         else:
-            self.me = await self.get_me()
             try:
+                self.me = await self.get_me()
                 await self.initialize()
             except BaseException:
+                # 同上:get_me / initialize 失败或被取消也必须把连接收掉。
+                # initialize 走到一半时 dispatcher 可能已启动,is_initialized 还没置位,
+                # 所以不能走 terminate(),直接停更新管理器和会话。
                 if self.update_manager is not None:
                     await self.update_manager.stop()
-                    await self.disconnect()
+                if not self.is_initialized:
+                    # 已断开时 disconnect() 会抛 ConnectionError,别让它盖住原始异常
+                    with contextlib.suppress(ConnectionError):
+                        await self.disconnect()
                 raise
 
             return self
